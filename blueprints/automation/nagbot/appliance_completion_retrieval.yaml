@@ -1,0 +1,212 @@
+blueprint:
+  name: Power-based appliance completion and retrieval
+  description: >-
+    Tracks an appliance cycle using sustained power thresholds, survives normal
+    heater or motor cycling, and keeps a persistent waiting state until its door
+    opens. Separate input_boolean helpers preserve active and waiting states
+    across Home Assistant restarts. Suitable for ovens, washers, dryers, and
+    dishwashers.
+  domain: automation
+  author: Kurt Hammond
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    appliance:
+      name: Appliance entities
+      icon: mdi:power-plug-outline
+      input:
+        power_sensor:
+          name: Power sensor
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: power
+        door_sensor:
+          name: Door sensor
+          selector:
+            entity:
+              filter:
+                - domain: binary_sensor
+                  device_class: door
+                - domain: binary_sensor
+                  device_class: opening
+        cycle_active_helper:
+          name: Cycle-active helper
+          selector:
+            entity:
+              filter:
+                domain: input_boolean
+        waiting_helper:
+          name: Waiting-for-retrieval helper
+          selector:
+            entity:
+              filter:
+                domain: input_boolean
+    thresholds:
+      name: Power and debounce thresholds
+      icon: mdi:chart-line
+      input:
+        running_power:
+          name: Running power
+          description: Power must remain above this level to start a cycle.
+          default: 50
+          selector:
+            number:
+              min: 0
+              max: 5000
+              step: 1
+              unit_of_measurement: W
+        idle_power:
+          name: Idle power
+          description: Power must remain below this level to complete a cycle.
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 1000
+              step: 1
+              unit_of_measurement: W
+        start_debounce:
+          name: Start debounce
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 1
+              unit_of_measurement: seconds
+        completion_debounce:
+          name: Completion debounce
+          description: Long enough to ignore normal heating or motor pauses.
+          default: 60
+          selector:
+            number:
+              min: 5
+              max: 1800
+              step: 5
+              unit_of_measurement: seconds
+    responses:
+      name: Lifecycle actions
+      icon: mdi:bell-outline
+      input:
+        started_actions:
+          name: Cycle-started actions
+          default: []
+          selector:
+            action:
+        completed_actions:
+          name: Cycle-completed actions
+          default: []
+          selector:
+            action:
+        retrieved_actions:
+          name: Door-opened retrieval actions
+          default: []
+          selector:
+            action:
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+triggers:
+  - trigger: numeric_state
+    entity_id: !input power_sensor
+    above: !input running_power
+    for:
+      seconds: !input start_debounce
+    id: started
+  - trigger: numeric_state
+    entity_id: !input power_sensor
+    below: !input idle_power
+    for:
+      seconds: !input completion_debounce
+    id: completed
+  - trigger: state
+    entity_id: !input door_sensor
+    from: "off"
+    to: "on"
+    id: retrieved
+  - trigger: homeassistant
+    event: start
+    id: startup
+
+variables:
+  power_entity: !input power_sensor
+  active_helper: !input cycle_active_helper
+  waiting_helper: !input waiting_helper
+  running_watts: !input running_power
+  idle_watts: !input idle_power
+
+actions:
+  - choose:
+      - alias: Start or restart a cycle
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'started' and
+                 not is_state(active_helper, 'on') }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ waiting_helper }}"
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ active_helper }}"
+          - sequence: !input started_actions
+      - alias: Complete only a known active cycle
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'completed' and
+                 is_state(active_helper, 'on') }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ active_helper }}"
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ waiting_helper }}"
+          - sequence: !input completed_actions
+      - alias: Clear the waiting state when the door opens
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'retrieved' and
+                 is_state(waiting_helper, 'on') }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ waiting_helper }}"
+          - sequence: !input retrieved_actions
+      - alias: Reconcile an active appliance after Home Assistant starts
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'startup' and
+                 states(power_entity) not in ['unknown', 'unavailable'] and
+                 (states(power_entity) | float(0)) > (running_watts | float) }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ waiting_helper }}"
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ active_helper }}"
+      - alias: Reconcile a completed active cycle after Home Assistant starts
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'startup' and
+                 is_state(active_helper, 'on') and
+                 states(power_entity) not in ['unknown', 'unavailable'] and
+                 (states(power_entity) | float(0)) < (idle_watts | float) }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ active_helper }}"
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ waiting_helper }}"
+          - sequence: !input completed_actions

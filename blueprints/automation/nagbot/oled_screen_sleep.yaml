@@ -1,0 +1,137 @@
+blueprint:
+  name: OLED screen sleep with deep standby recovery
+  description: >-
+    Blanks an OLED panel after a short period with no occupancy or computer
+    activity, then optionally enters full standby after a longer idle period so
+    the display can run panel maintenance. Any new activity cancels the pending
+    shutdown, runs recovery actions, and restores the screen. Unknown or
+    unavailable activity sensors never initiate a shutdown.
+  domain: automation
+  author: Kurt Hammond
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    devices:
+      name: Display and activity
+      icon: mdi:monitor-eye
+      input:
+        activity_sensors:
+          name: Occupancy and computer activity sensors
+          description: >-
+            The screen remains on while any selected sensor is on. A shutdown
+            begins only when every selected sensor explicitly reports off.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: binary_sensor
+        screen_switch:
+          name: OLED screen switch
+          description: The switch that blanks or restores the panel without powering off the TV.
+          selector:
+            entity:
+              filter:
+                domain: switch
+    timing:
+      name: Timing
+      icon: mdi:timer-outline
+      input:
+        screen_off_delay:
+          name: Screen-off delay
+          default: 60
+          selector:
+            number:
+              min: 0
+              max: 3600
+              step: 5
+              unit_of_measurement: seconds
+              mode: box
+        deep_standby_delay:
+          name: Full-standby delay
+          description: Total idle time before the full-standby actions run.
+          default: 1800
+          selector:
+            number:
+              min: 60
+              max: 21600
+              step: 60
+              unit_of_measurement: seconds
+              mode: box
+    advanced:
+      name: Recovery and maintenance actions
+      icon: mdi:cog-outline
+      collapsed: true
+      input:
+        recovery_actions:
+          name: Actions before restoring the screen
+          description: >-
+            Optional actions that power an outlet or wake the TV after full
+            standby. They also run for ordinary activity signals, so make them
+            safe to repeat.
+          default: []
+          selector:
+            action:
+        full_standby_actions:
+          name: Full-standby actions
+          description: >-
+            Optional actions that fully turn off the TV after extended
+            inactivity. Leave empty to use screen blanking only.
+          default: []
+          selector:
+            action:
+
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input activity_sensors
+  - trigger: homeassistant
+    event: start
+
+variables:
+  activity_entities: !input activity_sensors
+  screen_off_seconds: !input screen_off_delay
+  deep_standby_seconds: !input deep_standby_delay
+
+actions:
+  - choose:
+      - alias: Restore immediately when any activity source is on
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ expand(activity_entities)
+                 | selectattr('state', 'eq', 'on') | list | count > 0 }}
+        sequence:
+          - sequence: !input recovery_actions
+          - action: switch.turn_on
+            target:
+              entity_id: !input screen_switch
+      - alias: Blank only when every activity source is explicitly off
+        conditions:
+          - condition: template
+            value_template: >-
+              {% set sources = expand(activity_entities) | list %}
+              {{ sources | count > 0 and
+                 sources | rejectattr('state', 'eq', 'off') | list | count == 0 }}
+        sequence:
+          - delay:
+              seconds: "{{ screen_off_seconds | int(0) }}"
+          - condition: template
+            value_template: >-
+              {% set sources = expand(activity_entities) | list %}
+              {{ sources | count > 0 and
+                 sources | rejectattr('state', 'eq', 'off') | list | count == 0 }}
+          - action: switch.turn_off
+            target:
+              entity_id: !input screen_switch
+          - delay:
+              seconds: >-
+                {{ [0, (deep_standby_seconds | int(0)) -
+                        (screen_off_seconds | int(0))] | max }}
+          - condition: template
+            value_template: >-
+              {% set sources = expand(activity_entities) | list %}
+              {{ sources | count > 0 and
+                 sources | rejectattr('state', 'eq', 'off') | list | count == 0 }}
+          - sequence: !input full_standby_actions

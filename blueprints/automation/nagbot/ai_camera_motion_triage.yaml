@@ -1,0 +1,228 @@
+blueprint:
+  name: AI camera motion triage with immediate feedback
+  description: >-
+    Acknowledges motion immediately, saves the first frame, waits for a clearer
+    view, and asks a Home Assistant AI Task to classify the scene using both
+    frames. Configurable actions receive structured variables for meaningful,
+    routine, and failed analyses. Single-flight execution and a cooldown prevent
+    a noisy motion sensor from launching overlapping AI work.
+  domain: automation
+  author: Kurt Hammond
+  homeassistant:
+    min_version: 2025.8.0
+  input:
+    source:
+      name: Motion and camera
+      icon: mdi:cctv
+      input:
+        motion_sensors:
+          name: Motion sensors
+          selector:
+            entity:
+              multiple: true
+              filter:
+                domain: binary_sensor
+        camera_entity:
+          name: Camera
+          selector:
+            entity:
+              filter:
+                domain: camera
+        ai_task_entity:
+          name: Vision-capable AI Task entity
+          selector:
+            entity:
+              filter:
+                domain: ai_task
+        additional_conditions:
+          name: Additional conditions
+          description: Optional conditions such as quiet hours, presence, or door state.
+          default: []
+          selector:
+            condition:
+    analysis:
+      name: Analysis
+      icon: mdi:image-search-outline
+      input:
+        analysis_prompt:
+          name: Scene instructions
+          default: >-
+            Compare the two camera frames and briefly describe what caused the
+            motion. Notify only for a person, vehicle, delivered package, animal,
+            safety concern, or another meaningful change. Ignore lighting,
+            insects, shadows, rain, and an unchanged empty scene. Do not identify
+            a person by name or infer sensitive traits.
+          selector:
+            template:
+        settle_delay:
+          name: Delay before the second frame
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 1
+              unit_of_measurement: seconds
+        cooldown:
+          name: Cooldown after each analysis
+          default: 120
+          selector:
+            number:
+              min: 0
+              max: 1800
+              step: 10
+              unit_of_measurement: seconds
+        snapshot_filename:
+          name: First-frame file path
+          default: /media/ai_motion_triage_before.jpg
+          selector:
+            text:
+        snapshot_media_source:
+          name: First-frame media source
+          default: media-source://media_source/local/ai_motion_triage_before.jpg
+          selector:
+            text:
+    responses:
+      name: Response actions
+      icon: mdi:message-processing-outline
+      input:
+        checking_actions:
+          name: Immediate acknowledgement actions
+          description: Runs before snapshots or AI processing.
+          default: []
+          selector:
+            action:
+        alert_actions:
+          name: Meaningful activity actions
+          description: >-
+            Variables available: `ai_title`, `ai_message`, `ai_category`, and
+            `ai_urgent`.
+          selector:
+            action:
+        routine_actions:
+          name: Ignored or routine activity actions
+          description: Uses the same AI result variables.
+          default: []
+          selector:
+            action:
+        failure_actions:
+          name: AI failure actions
+          description: Runs after a short grace period if the AI task fails.
+          default: []
+          selector:
+            action:
+        failure_grace_period:
+          name: Failure grace period
+          default: 8
+          selector:
+            number:
+              min: 0
+              max: 60
+              step: 1
+              unit_of_measurement: seconds
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_sensors
+    from: "off"
+    to: "on"
+
+conditions:
+  - condition: and
+    conditions: !input additional_conditions
+
+variables:
+  camera: !input camera_entity
+  ai_entity: !input ai_task_entity
+  prompt: !input analysis_prompt
+  settle_seconds: !input settle_delay
+  cooldown_seconds: !input cooldown
+  first_frame_path: !input snapshot_filename
+  first_frame_media: !input snapshot_media_source
+  failure_delay: !input failure_grace_period
+
+actions:
+  - sequence: !input checking_actions
+  - action: camera.snapshot
+    continue_on_error: true
+    target:
+      entity_id: !input camera_entity
+    data:
+      filename: "{{ first_frame_path }}"
+  - delay:
+      seconds: "{{ settle_seconds | int(0) }}"
+  - action: ai_task.generate_data
+    continue_on_error: true
+    data:
+      entity_id: "{{ ai_entity }}"
+      task_name: Camera motion triage
+      instructions: "{{ prompt }}"
+      structure:
+        should_notify:
+          description: True only when the scene contains meaningful activity.
+          required: true
+          selector:
+            boolean:
+        title:
+          description: A concise notification title.
+          required: true
+          selector:
+            text:
+        message:
+          description: One or two factual sentences describing the change.
+          required: true
+          selector:
+            text:
+        category:
+          description: The closest scene category.
+          required: true
+          selector:
+            select:
+              options:
+                - person
+                - vehicle
+                - package
+                - animal
+                - safety
+                - routine
+                - unknown
+        urgent:
+          description: True only when immediate attention is warranted.
+          required: true
+          selector:
+            boolean:
+      attachments:
+        - media_content_id: "{{ first_frame_media }}"
+          media_content_type: image/jpeg
+        - media_content_id: "media-source://camera/{{ camera }}"
+          media_content_type: image/jpeg
+    response_variable: ai_result
+  - choose:
+      - alias: Process a valid structured result
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ ai_result is defined and ai_result.data is defined and
+                 ai_result.data is mapping }}
+        sequence:
+          - variables:
+              ai_title: "{{ ai_result.data.title | default('Camera activity') }}"
+              ai_message: "{{ ai_result.data.message | default('Activity was detected.') }}"
+              ai_category: "{{ ai_result.data.category | default('unknown') }}"
+              ai_urgent: "{{ ai_result.data.urgent | default(false) | bool }}"
+              ai_should_notify: "{{ ai_result.data.should_notify | default(true) | bool }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ ai_should_notify }}"
+                sequence: !input alert_actions
+            default: !input routine_actions
+    default:
+      - delay:
+          seconds: "{{ failure_delay | int(0) }}"
+      - sequence: !input failure_actions
+  - delay:
+      seconds: "{{ cooldown_seconds | int(0) }}"

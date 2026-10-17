@@ -1,0 +1,217 @@
+blueprint:
+  name: Stable smart-scale identification for two people
+  description: >-
+    Records one stable scale reading per session and assigns it only when the
+    measurement is close enough to one person's saved reference and clearly
+    farther from the other person's. Presence can narrow the candidates without
+    overriding the confidence checks. Uncertain readings are never learned.
+  domain: automation
+  author: Kurt Hammond
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    scale:
+      name: Scale entities
+      icon: mdi:scale-bathroom
+      input:
+        measurement_ready:
+          name: Stable measurement ready sensor
+          selector:
+            entity:
+              filter:
+                domain: binary_sensor
+        weight_sensor:
+          name: Stable weight sensor
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: weight
+        minimum_weight:
+          name: Minimum valid weight
+          default: 20
+          selector:
+            number:
+              min: 0
+              max: 300
+              step: 0.1
+              unit_of_measurement: kg
+        maximum_weight:
+          name: Maximum valid weight
+          default: 250
+          selector:
+            number:
+              min: 1
+              max: 500
+              step: 0.1
+              unit_of_measurement: kg
+    profiles:
+      name: Person profiles
+      icon: mdi:account-multiple-outline
+      input:
+        person_one_name:
+          name: First person's display name
+          selector:
+            text:
+        person_one_presence:
+          name: First person's presence entity
+          selector:
+            entity:
+              filter:
+                domain: person
+        person_one_reference:
+          name: First person's weight helper
+          description: An input_number containing this person's most recent identified weight.
+          selector:
+            entity:
+              filter:
+                domain: input_number
+        person_two_name:
+          name: Second person's display name
+          selector:
+            text:
+        person_two_presence:
+          name: Second person's presence entity
+          selector:
+            entity:
+              filter:
+                domain: person
+        person_two_reference:
+          name: Second person's weight helper
+          selector:
+            entity:
+              filter:
+                domain: input_number
+    confidence:
+      name: Confidence rules
+      icon: mdi:shield-check-outline
+      input:
+        require_presence:
+          name: Require a person to be home
+          default: true
+          selector:
+            boolean:
+        maximum_distance:
+          name: Maximum difference from saved weight
+          default: 12
+          selector:
+            number:
+              min: 0.5
+              max: 50
+              step: 0.5
+              unit_of_measurement: kg
+        minimum_lead:
+          name: Required lead over the other profile
+          description: The winning profile must be at least this much closer.
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 20
+              step: 0.5
+              unit_of_measurement: kg
+    responses:
+      name: Response actions
+      icon: mdi:account-check-outline
+      input:
+        identified_actions:
+          name: Identified measurement actions
+          description: >-
+            Variables available: `measured_weight`, `identified_name`, and
+            `identified_reference`.
+          default: []
+          selector:
+            action:
+        unknown_actions:
+          name: Uncertain measurement actions
+          description: "`measured_weight` is available. No reference is updated."
+          default: []
+          selector:
+            action:
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input measurement_ready
+    from: "off"
+    to: "on"
+
+variables:
+  weight_entity: !input weight_sensor
+  profile_one_name: !input person_one_name
+  profile_one_presence: !input person_one_presence
+  profile_one_reference: !input person_one_reference
+  profile_two_name: !input person_two_name
+  profile_two_presence: !input person_two_presence
+  profile_two_reference: !input person_two_reference
+  use_presence: !input require_presence
+  max_distance: !input maximum_distance
+  required_lead: !input minimum_lead
+  min_weight: !input minimum_weight
+  max_weight: !input maximum_weight
+  measured_weight: "{{ states(weight_entity) | float(0) | round(1) }}"
+  profile_one_distance: >-
+    {{ ((measured_weight | float) -
+        (states(profile_one_reference) | float(0))) | abs }}
+  profile_two_distance: >-
+    {{ ((measured_weight | float) -
+        (states(profile_two_reference) | float(0))) | abs }}
+  profile_one_eligible: >-
+    {{ ((not (use_presence | bool)) or is_state(profile_one_presence, 'home')) and
+       (profile_one_distance | float) <= (max_distance | float) }}
+  profile_two_eligible: >-
+    {{ ((not (use_presence | bool)) or is_state(profile_two_presence, 'home')) and
+       (profile_two_distance | float) <= (max_distance | float) }}
+  identified_profile: >-
+    {% if profile_one_eligible | bool and
+          (not (profile_two_eligible | bool) or
+           (profile_one_distance | float) + (required_lead | float) <=
+           (profile_two_distance | float)) %}
+      one
+    {% elif profile_two_eligible | bool and
+            (not (profile_one_eligible | bool) or
+             (profile_two_distance | float) + (required_lead | float) <=
+             (profile_one_distance | float)) %}
+      two
+    {% else %}
+      unknown
+    {% endif %}
+
+conditions:
+  - condition: template
+    value_template: >-
+      {{ (min_weight | float) <= (measured_weight | float) <=
+         (max_weight | float) }}
+
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ identified_profile | trim == 'one' }}"
+        sequence:
+          - variables:
+              identified_name: "{{ profile_one_name }}"
+              identified_reference: "{{ profile_one_reference }}"
+          - action: input_number.set_value
+            target:
+              entity_id: "{{ identified_reference }}"
+            data:
+              value: "{{ measured_weight }}"
+          - sequence: !input identified_actions
+      - conditions:
+          - condition: template
+            value_template: "{{ identified_profile | trim == 'two' }}"
+        sequence:
+          - variables:
+              identified_name: "{{ profile_two_name }}"
+              identified_reference: "{{ profile_two_reference }}"
+          - action: input_number.set_value
+            target:
+              entity_id: "{{ identified_reference }}"
+            data:
+              value: "{{ measured_weight }}"
+          - sequence: !input identified_actions
+    default:
+      - sequence: !input unknown_actions
